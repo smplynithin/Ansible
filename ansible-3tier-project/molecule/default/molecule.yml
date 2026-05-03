@@ -1,0 +1,46 @@
+# ============================================================
+# molecule/default/molecule.yml — Molecule Test Config
+# TOPIC COVERED: Molecule (role testing framework)
+#
+# What is Molecule?
+#   - Framework to TEST your Ansible roles
+#   - Creates a fresh VM/container, runs your role, tests it
+#   - Like pytest but for Ansible roles
+#
+# Install: pip install molecule molecule-docker
+# Run:     molecule test        (full test cycle)
+#          molecule converge    (just run the role)
+#          molecule verify      (just run tests)
+#          molecule destroy     (clean up)
+# ============================================================
+---
+dependency:
+  name: galaxy                  # install role dependencies from Galaxy
+
+driver:
+  name: docker                  # use Docker containers (or vagrant, ec2)
+
+platforms:
+  - name: ubuntu-test           # name of the test container
+    image: ubuntu:22.04
+    pre_build_image: true
+    privileged: true            # needed for systemd in Docker
+
+  - name: centos-test           # test on CentOS too!
+    image: centos:8
+    pre_build_image: true
+    privileged: true
+
+provisioner:
+  name: ansible
+  playbooks:
+    converge: converge.yml
+    verify: verify.yml
+
+verifier:
+  name: ansible                 # use Ansible for assertions (or testinfra)
+
+lint: |
+  set -e
+  yamllint .
+  ansible-lint

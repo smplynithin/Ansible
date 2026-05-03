@@ -1,0 +1,22 @@
+# ============================================================
+# group_vars/dbservers.yml — Variables ONLY for DB servers
+# ============================================================
+postgres_version: "15"
+postgres_data_dir: "/var/lib/postgresql/15/main"
+postgres_config_dir: "/etc/postgresql/15/main"
+
+# Performance tuning
+postgres_max_connections: 200
+postgres_shared_buffers: "256MB"
+postgres_effective_cache_size: "1GB"
+postgres_work_mem: "4MB"
+
+# Database setup
+db_name: appdb
+db_user: appuser
+db_password: "{{ vault_db_password }}"   # ← from Vault!
+
+# Which IPs allowed to connect (CIDR notation)
+postgres_allowed_hosts:
+  - "172.31.20.0/24"   # App server subnet
+  - "172.31.10.0/24"   # Web server subnet (for health checks)

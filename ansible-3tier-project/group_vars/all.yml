@@ -1,0 +1,43 @@
+# ============================================================
+# group_vars/all.yml — Variables for ALL hosts
+# TOPIC COVERED: Variables, group_vars, variable precedence
+#
+# Variable precedence (lowest to highest):
+#   defaults < group_vars/all < group_vars/<group> < host_vars < extra_vars
+# ============================================================
+
+# App identity
+app_name: myapp
+app_version: "2.1.0"
+app_owner: ubuntu
+
+# Directory layout
+app_base_dir: "/opt/{{ app_name }}"
+app_log_dir: "/var/log/{{ app_name }}"
+app_config_dir: "/etc/{{ app_name }}"
+
+# Network ports
+nginx_port: 80
+tomcat_port: 8080
+postgres_port: 5432
+
+# Java version (used by Tomcat role)
+java_version: "17"
+
+# Common packages every server needs
+common_packages:
+  - curl
+  - wget
+  - vim
+  - htop
+  - git
+  - net-tools
+  - python3-pip
+  - unzip
+
+# Timezone
+server_timezone: "Asia/Kolkata"
+
+# Notification settings (Slack webhook — real value in vault!)
+slack_webhook_url: "{{ vault_slack_webhook }}"
+slack_channel: "#devops-alerts"

@@ -1,0 +1,140 @@
+# ============================================================
+# roles/nginx/tasks/main.yml
+# TOPICS COVERED:
+#   - Modules: apt, service, template, file, command
+#   - Handlers: notify
+#   - Conditions: when + register
+#   - Error Handling: block / rescue / always
+#   - Delegate_to: run task on a different host
+#   - Tags
+# ============================================================
+---
+
+# ──────────────────────────────────────────────
+# SECTION 1: Install Nginx
+# ──────────────────────────────────────────────
+
+- name: "[nginx] Install Nginx web server"
+  apt:
+    name: nginx
+    state: present
+    update_cache: yes
+  notify: Start Nginx           # handler fires at end of play
+  tags: [nginx, install]
+
+# ──────────────────────────────────────────────
+# SECTION 2: Block / Rescue / Always
+# TOPIC: Error handling with block/rescue/always
+#
+# block   = try this
+# rescue  = if block fails, run this
+# always  = run this NO MATTER WHAT (success or fail)
+# ──────────────────────────────────────────────
+
+- name: "[nginx] Configure Nginx (with error handling)"
+  block:
+
+    - name: "[nginx] Remove default Nginx site"
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: "[nginx] Deploy nginx.conf from Jinja2 template"
+      template:
+        src: nginx.conf.j2
+        dest: "/etc/nginx/sites-available/{{ app_name }}"
+        owner: root
+        group: root
+        mode: '0644'
+        validate: "nginx -t -c %s"    # validates BEFORE overwriting!
+      notify: Reload Nginx
+      tags: [nginx, config]
+
+    - name: "[nginx] Enable our site (symlink)"
+      file:
+        src: "/etc/nginx/sites-available/{{ app_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ app_name }}"
+        state: link
+      notify: Reload Nginx
+
+    - name: "[nginx] Test Nginx configuration syntax"
+      command: nginx -t
+      changed_when: false           # this task never counts as "changed"
+      register: nginx_test_result
+
+    - name: "[nginx] Show nginx test result"
+      debug:
+        var: nginx_test_result.stderr_lines
+      when: nginx_test_result.rc != 0
+
+  rescue:
+    # This block runs ONLY if any task above fails
+    - name: "[nginx] RESCUE — Config failed, restore backup"
+      debug:
+        msg: >
+          Nginx configuration failed on {{ inventory_hostname }}!
+          Check /etc/nginx/sites-available/{{ app_name }}
+
+    - name: "[nginx] RESCUE — Write failure to log"
+      lineinfile:
+        path: "{{ app_log_dir }}/deploy_errors.log"
+        line: "{{ ansible_date_time.iso8601 }} | NGINX CONFIG FAIL | {{ inventory_hostname }}"
+        create: yes
+
+  always:
+    # This ALWAYS runs — success or fail
+    - name: "[nginx] ALWAYS — Ensure Nginx is running"
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+  tags: [nginx, config]
+
+# ──────────────────────────────────────────────
+# SECTION 3: Delegate_to
+# TOPIC: Run a task on a DIFFERENT host than the current one
+#
+# Use case: "While configuring web01, tell the monitoring
+#            server to pause alerts for this host"
+# ──────────────────────────────────────────────
+
+- name: "[nginx] DELEGATE — Log deployment on control node"
+  shell: |
+    echo "{{ ansible_date_time.iso8601 }} | nginx deployed on {{ inventory_hostname }}" \
+    >> /tmp/deployment_audit.log
+  delegate_to: localhost          # runs on YOUR machine, not the remote!
+  run_once: false                 # runs once per host (not once total)
+  tags: [nginx, audit]
+
+# Practical delegate_to: register new server in load balancer
+- name: "[nginx] DELEGATE — Notify primary LB about new backend"
+  command: >
+    echo "New backend {{ inventory_hostname }} registered"
+  delegate_to: "{{ groups['webservers'][0] }}"   # delegate to web01
+  when: inventory_hostname in groups['appservers']
+  run_once: true
+  tags: [nginx, delegate]
+
+# ──────────────────────────────────────────────
+# SECTION 4: Setup nginx log rotation
+# MODULE: copy (inline content)
+# ──────────────────────────────────────────────
+
+- name: "[nginx] Configure log rotation"
+  copy:
+    dest: /etc/logrotate.d/nginx-app
+    content: |
+      {{ app_log_dir }}/*.log {
+          daily
+          missingok
+          rotate 14
+          compress
+          delaycompress
+          notifempty
+          sharedscripts
+          postrotate
+              nginx -s reopen
+          endscript
+      }
+    mode: '0644'
+  tags: [nginx, logs]

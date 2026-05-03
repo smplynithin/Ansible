@@ -1,0 +1,161 @@
+# ============================================================
+# roles/tomcat/tasks/main.yml
+# TOPICS COVERED:
+#   - Modules: apt, get_url, unarchive, template, service
+#   - register + when (multi-step conditional)
+#   - loop with index (loop.index)
+#   - set_fact (create variable mid-play)
+#   - Tags
+# ============================================================
+---
+
+# ──────────────────────────────────────────────
+# SECTION 1: Install Java (Tomcat dependency)
+# ──────────────────────────────────────────────
+
+- name: "[tomcat] Install OpenJDK {{ java_version }}"
+  apt:
+    name: "openjdk-{{ java_version }}-jdk"
+    state: present
+    update_cache: yes
+  tags: [tomcat, java]
+
+- name: "[tomcat] Verify Java installation"
+  command: java -version
+  register: java_version_output   # capture output
+  changed_when: false             # java -version never "changes" anything
+
+- name: "[tomcat] Display installed Java version"
+  debug:
+    msg: "Java installed: {{ java_version_output.stderr }}"
+  tags: [tomcat, java]
+
+# ──────────────────────────────────────────────
+# SECTION 2: Create Tomcat user (security best practice)
+# MODULE: user, group
+# ──────────────────────────────────────────────
+
+- name: "[tomcat] Create tomcat group"
+  group:
+    name: tomcat
+    state: present
+  tags: [tomcat, user]
+
+- name: "[tomcat] Create tomcat system user"
+  user:
+    name: tomcat
+    group: tomcat
+    system: yes               # system user — no shell, no home login
+    shell: /bin/false         # can't SSH in as tomcat
+    home: "{{ tomcat_install_dir }}"
+    create_home: no
+  tags: [tomcat, user]
+
+# ──────────────────────────────────────────────
+# SECTION 3: Download and Install Tomcat
+# MODULE: get_url, unarchive, file
+# register + when: only download if not already there
+# ──────────────────────────────────────────────
+
+- name: "[tomcat] Check if Tomcat already installed"
+  stat:
+    path: "{{ tomcat_home }}/bin/catalina.sh"
+  register: tomcat_installed
+
+- name: "[tomcat] Create install directory"
+  file:
+    path: "{{ tomcat_install_dir }}"
+    state: directory
+    owner: tomcat
+    group: tomcat
+    mode: '0755'
+  when: not tomcat_installed.stat.exists
+  tags: [tomcat, install]
+
+- name: "[tomcat] Download Tomcat {{ tomcat_version }}"
+  get_url:
+    url: "https://archive.apache.org/dist/tomcat/tomcat-10/v{{ tomcat_version }}/bin/apache-tomcat-{{ tomcat_version }}.tar.gz"
+    dest: "/tmp/apache-tomcat-{{ tomcat_version }}.tar.gz"
+    mode: '0644'
+  when: not tomcat_installed.stat.exists
+  tags: [tomcat, install]
+
+- name: "[tomcat] Extract Tomcat"
+  unarchive:
+    src: "/tmp/apache-tomcat-{{ tomcat_version }}.tar.gz"
+    dest: "{{ tomcat_install_dir }}"
+    remote_src: yes            # file is already on the remote node!
+    owner: tomcat
+    group: tomcat
+  when: not tomcat_installed.stat.exists
+  tags: [tomcat, install]
+
+# ──────────────────────────────────────────────
+# SECTION 4: Configure Tomcat
+# MODULE: template
+# set_fact: create a new variable mid-play
+# ──────────────────────────────────────────────
+
+- name: "[tomcat] Set JAVA_HOME fact dynamically"
+  set_fact:
+    java_home: "{{ '/usr/lib/jvm/java-' + java_version + '-openjdk-amd64' }}"
+  tags: [tomcat, config]
+
+- name: "[tomcat] Deploy setenv.sh (JVM settings)"
+  template:
+    src: setenv.sh.j2
+    dest: "{{ tomcat_home }}/bin/setenv.sh"
+    owner: tomcat
+    group: tomcat
+    mode: '0755'
+  notify: Restart Tomcat
+  tags: [tomcat, config]
+
+- name: "[tomcat] Deploy server.xml (Tomcat port config)"
+  template:
+    src: server.xml.j2
+    dest: "{{ tomcat_home }}/conf/server.xml"
+    owner: tomcat
+    group: tomcat
+    mode: '0640'
+  notify: Restart Tomcat
+  tags: [tomcat, config]
+
+- name: "[tomcat] Install Tomcat as systemd service"
+  template:
+    src: tomcat.service.j2
+    dest: /etc/systemd/system/tomcat.service
+    mode: '0644'
+  notify:
+    - Reload systemd
+    - Restart Tomcat
+  tags: [tomcat, service]
+
+# ──────────────────────────────────────────────
+# SECTION 5: Deploy WAR file
+# MODULE: copy (from files/ directory)
+# loop with index: loop.index, loop.first, loop.last
+# ──────────────────────────────────────────────
+
+- name: "[tomcat] Deploy application WAR files"
+  copy:
+    src: "{{ item.war }}"
+    dest: "{{ war_deploy_path }}{{ item.context }}.war"
+    owner: tomcat
+    group: tomcat
+    mode: '0644'
+  loop:
+    - { war: "myapp.war",    context: "myapp" }
+    - { war: "api.war",      context: "api" }
+  loop_control:
+    label: "Deploying {{ item.context }}.war"  # cleaner output
+  notify: Restart Tomcat
+  tags: [tomcat, deploy]
+
+- name: "[tomcat] Enable and start Tomcat service"
+  systemd:
+    name: tomcat
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  tags: [tomcat, service]

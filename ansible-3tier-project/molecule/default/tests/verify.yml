@@ -1,0 +1,42 @@
+# ============================================================
+# molecule/default/tests/verify.yml
+# TOPIC: Molecule — assert your role did what it should
+# ============================================================
+---
+- name: "Molecule verify — assert common role worked correctly"
+  hosts: all
+  gather_facts: yes
+
+  tasks:
+    - name: "TEST — Check app directories exist"
+      stat:
+        path: "{{ item }}"
+      register: dir_check
+      loop:
+        - /opt/testapp
+        - /var/log/testapp
+        - /etc/testapp
+      failed_when: not dir_check.stat.exists   # FAIL if dir missing
+
+    - name: "TEST — Verify git is installed"
+      command: git --version
+      changed_when: false
+
+    - name: "TEST — Verify curl is installed"
+      command: curl --version
+      changed_when: false
+
+    - name: "TEST — Check custom fact file exists"
+      stat:
+        path: /etc/ansible/facts.d/appinfo.fact
+      register: fact_file
+      failed_when: not fact_file.stat.exists
+
+    - name: "TEST — Verify SSH PermitRootLogin is disabled"
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        line: "PermitRootLogin no"
+        state: present
+      check_mode: yes
+      register: root_login_check
+      failed_when: root_login_check.changed   # FAIL if line not found

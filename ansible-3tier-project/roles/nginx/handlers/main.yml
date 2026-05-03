@@ -1,0 +1,19 @@
+# ============================================================
+# roles/nginx/handlers/main.yml
+# ============================================================
+---
+- name: Start Nginx
+  service:
+    name: nginx
+    state: started
+    enabled: yes
+
+- name: Reload Nginx
+  service:
+    name: nginx
+    state: reloaded   # graceful — doesn't drop connections!
+
+- name: Restart Nginx
+  service:
+    name: nginx
+    state: restarted  # hard restart — drops connections briefly

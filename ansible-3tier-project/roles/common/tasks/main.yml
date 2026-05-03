@@ -1,0 +1,183 @@
+# ============================================================
+# roles/common/tasks/main.yml — Common setup for ALL servers
+# TOPICS COVERED:
+#   - Modules: apt, file, copy, template, command, service, lineinfile
+#   - Variables: vars, registered vars
+#   - Conditions: when
+#   - Loops: loop (replaces with_items in modern Ansible)
+#   - Tags
+#   - Error handling: ignore_errors
+#   - Custom facts
+# ============================================================
+---
+
+# ──────────────────────────────────────────────
+# SECTION 1: Package Management
+# MODULE: apt (Ubuntu/Debian), yum (RHEL/CentOS)
+# ──────────────────────────────────────────────
+
+- name: "[common] Update apt package cache"
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600    # only update if cache > 1 hour old
+  tags: [common, packages]
+
+- name: "[common] Install common packages"
+  apt:
+    name: "{{ common_packages }}"   # from group_vars/all.yml
+    state: present                  # ensure installed (not latest)
+  tags: [common, packages]
+
+# MODULE: yum — example for RHEL/CentOS (conditional install)
+- name: "[common] Install common packages (RHEL/CentOS)"
+  yum:
+    name: "{{ common_packages }}"
+    state: present
+  when: ansible_os_family == "RedHat"   # CONDITION: OS check
+  tags: [common, packages]
+
+- name: "[common] Remove unwanted packages"
+  apt:
+    name:
+      - telnet       # insecure — remove it
+      - rsh-client   # insecure — remove it
+    state: absent
+  ignore_errors: yes   # TOPIC: don't fail if package not installed
+  tags: [common, security]
+
+# ──────────────────────────────────────────────
+# SECTION 2: Directory Setup
+# MODULE: file — create dirs, set permissions
+# LOOP: loop (modern way, replaces with_items)
+# ──────────────────────────────────────────────
+
+- name: "[common] Create required application directories"
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ app_owner }}"
+    group: "{{ app_owner }}"
+    mode: "{{ item.mode }}"
+  loop:                           # TOPIC: loop over a list of dicts
+    - { path: "{{ app_base_dir }}",   mode: '0755' }
+    - { path: "{{ app_log_dir }}",    mode: '0755' }
+    - { path: "{{ app_config_dir }}", mode: '0750' }
+    - { path: "/opt/backups",         mode: '0700' }
+  tags: [common, dirs]
+
+# ──────────────────────────────────────────────
+# SECTION 3: Timezone setup
+# MODULE: timezone
+# ──────────────────────────────────────────────
+
+- name: "[common] Set server timezone to IST"
+  timezone:
+    name: "{{ server_timezone }}"   # Asia/Kolkata
+  notify: Restart cron              # TOPIC: handler notification
+  tags: [common, timezone]
+
+# ──────────────────────────────────────────────
+# SECTION 4: Register + When (Conditional)
+# MODULE: command, stat
+# TOPIC: register — capture output of a task
+# TOPIC: when — use registered value as condition
+# ──────────────────────────────────────────────
+
+- name: "[common] Check if swap file already exists"
+  stat:
+    path: "{{ swap_file_path }}"
+  register: swap_file_stat         # saves result in variable
+
+- name: "[common] Create swap file (only if it doesn't exist)"
+  command: "fallocate -l {{ swap_size_mb }}M {{ swap_file_path }}"
+  when: not swap_file_stat.stat.exists   # CONDITION using registered var
+  tags: [common, swap]
+
+- name: "[common] Set swap file permissions"
+  file:
+    path: "{{ swap_file_path }}"
+    mode: '0600'
+  when: not swap_file_stat.stat.exists
+  tags: [common, swap]
+
+- name: "[common] Format swap file"
+  command: "mkswap {{ swap_file_path }}"
+  when: not swap_file_stat.stat.exists
+  tags: [common, swap]
+
+- name: "[common] Enable swap"
+  command: "swapon {{ swap_file_path }}"
+  when: not swap_file_stat.stat.exists
+  tags: [common, swap]
+
+- name: "[common] Add swap to /etc/fstab (persist after reboot)"
+  lineinfile:
+    path: /etc/fstab
+    line: "{{ swap_file_path }} none swap sw 0 0"
+    state: present
+  when: not swap_file_stat.stat.exists
+  tags: [common, swap]
+
+# ──────────────────────────────────────────────
+# SECTION 5: Sysctl (kernel tuning)
+# LOOP: loop over a dict
+# MODULE: sysctl
+# ──────────────────────────────────────────────
+
+- name: "[common] Apply sysctl performance settings"
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+  loop: "{{ sysctl_settings | dict2items }}"   # Jinja2 filter: dict → list
+  tags: [common, sysctl]
+
+# ──────────────────────────────────────────────
+# SECTION 6: Custom Facts
+# TOPIC: Custom facts (stored in /etc/ansible/facts.d/)
+# Facts appear as: ansible_local.appinfo.version
+# ──────────────────────────────────────────────
+
+- name: "[common] Create facts.d directory"
+  file:
+    path: /etc/ansible/facts.d
+    state: directory
+    mode: '0755'
+  tags: [common, facts]
+
+- name: "[common] Write custom server fact file"
+  template:
+    src: appinfo.fact.j2
+    dest: /etc/ansible/facts.d/appinfo.fact
+    mode: '0644'
+  tags: [common, facts]
+
+- name: "[common] Reload custom facts from the node"
+  setup:
+    filter: ansible_local   # only gather local facts (fast)
+  tags: [common, facts]
+
+# ──────────────────────────────────────────────
+# SECTION 7: Security hardening
+# MODULE: lineinfile, copy
+# ──────────────────────────────────────────────
+
+- name: "[common] Disable root SSH login"
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^PermitRootLogin"
+    line: "PermitRootLogin no"
+    state: present
+    backup: yes             # creates a .bak copy before changing
+  notify: Restart SSH
+  tags: [common, security]
+
+- name: "[common] Disable password authentication (key-only SSH)"
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^PasswordAuthentication"
+    line: "PasswordAuthentication no"
+    state: present
+  notify: Restart SSH
+  tags: [common, security]

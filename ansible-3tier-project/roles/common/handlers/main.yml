@@ -1,0 +1,24 @@
+# ============================================================
+# roles/common/handlers/main.yml
+# TOPIC COVERED: Handlers
+#
+# KEY CONCEPTS:
+#  - Handlers run ONLY when notified by a task
+#  - Handlers run ONCE at the END of the play (even if notified 5 times)
+#  - If no task notifies them → they never run
+#  - Great for "restart service only if config changed"
+# ============================================================
+---
+- name: Restart SSH
+  service:
+    name: sshd
+    state: restarted
+
+- name: Restart cron
+  service:
+    name: cron
+    state: restarted
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes

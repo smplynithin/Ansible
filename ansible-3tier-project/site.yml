@@ -1,0 +1,180 @@
+# ============================================================
+# site.yml — Master Playbook
+# TOPICS COVERED:
+#   - Play structure: hosts, vars_files, roles, tags
+#   - Strategy: serial, linear, free
+#   - Gather_facts
+#   - Pre/Post tasks
+#   - Tags for selective run
+#
+# USAGE EXAMPLES:
+#   Full deploy:
+#     ansible-playbook site.yml --ask-vault-pass
+#
+#   Only nginx tier:
+#     ansible-playbook site.yml --tags nginx --ask-vault-pass
+#
+#   Dry run (no changes made):
+#     ansible-playbook site.yml --check --diff
+#
+#   Specific host only:
+#     ansible-playbook site.yml --limit web01
+#
+#   Skip DB tasks:
+#     ansible-playbook site.yml --skip-tags postgres
+#
+#   Verbose debug output:
+#     ansible-playbook site.yml -vvv
+# ============================================================
+---
+
+# ════════════════════════════════════════════════════════════
+# PLAY 1: Common baseline for ALL servers
+# ════════════════════════════════════════════════════════════
+- name: "PLAY 1 — Apply common baseline to all servers"
+  hosts: all
+  gather_facts: yes              # collects OS, IP, disk, RAM info
+  vars_files:
+    - vault/secrets.yml          # load encrypted secrets
+
+  pre_tasks:
+    # Pre-tasks run BEFORE roles
+    - name: "PRE — Verify Ansible version is recent enough"
+      assert:
+        that: ansible_version.full is version('2.12', '>=')
+        msg: "Need Ansible 2.12+, found {{ ansible_version.full }}"
+
+    - name: "PRE — Print deployment info"
+      debug:
+        msg: |
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          Deploying: {{ app_name }} v{{ app_version }}
+          Host:      {{ inventory_hostname }}
+          OS:        {{ ansible_distribution }} {{ ansible_distribution_version }}
+          IP:        {{ ansible_default_ipv4.address }}
+          CPU:       {{ ansible_processor_vcpus }} vCPUs
+          RAM:       {{ (ansible_memtotal_mb / 1024) | round(1) }} GB
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  roles:
+    - role: common
+      tags: [common]
+
+  post_tasks:
+    # Post-tasks run AFTER all roles
+    - name: "POST — Common setup complete"
+      debug:
+        msg: "✅ Common setup done on {{ inventory_hostname }}"
+      tags: [always]    # 'always' tag = runs even with --tags someothertag
+
+# ════════════════════════════════════════════════════════════
+# PLAY 2: Web / Load Balancer servers
+# STRATEGY: serial — deploys one at a time (rolling deploy)
+# ════════════════════════════════════════════════════════════
+- name: "PLAY 2 — Configure Nginx Load Balancers (rolling)"
+  hosts: webservers
+  gather_facts: yes
+  vars_files:
+    - vault/secrets.yml
+
+  # TOPIC: Strategy — serial
+  # serial: 1 = deploy to ONE server at a time
+  # serial: "50%" = deploy to 50% of servers, then next 50%
+  # If a deployment fails, the others are not touched
+  serial: 1
+
+  # max_fail_percentage: if MORE than this % fail, abort everything
+  max_fail_percentage: 0   # abort if ANY server fails
+
+  pre_tasks:
+    - name: "PRE — Remove web server from load balancer pool"
+      debug:
+        msg: "Removing {{ inventory_hostname }} from upstream before deploy..."
+      # In real life: use uri module to call your LB API here
+
+  roles:
+    - role: nginx
+      tags: [nginx, web]
+
+  post_tasks:
+    - name: "POST — Wait for Nginx to be healthy"
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}/health"
+        return_content: yes
+      register: health_check
+      until: health_check.status == 200    # retry until healthy
+      retries: 10
+      delay: 5                             # wait 5s between retries
+      tags: [nginx, healthcheck]
+
+    - name: "POST — Nginx health check passed"
+      debug:
+        msg: "✅ {{ inventory_hostname }} is healthy — adding back to pool"
+
+# ════════════════════════════════════════════════════════════
+# PLAY 3: Application servers
+# STRATEGY: serial with percentage
+# ════════════════════════════════════════════════════════════
+- name: "PLAY 3 — Deploy Tomcat Application Servers"
+  hosts: appservers
+  gather_facts: yes
+  vars_files:
+    - vault/secrets.yml
+
+  # Deploy 50% of app servers first, then the other 50%
+  # Ensures half the fleet stays up during deployment
+  serial: "50%"
+
+  roles:
+    - role: tomcat
+      tags: [tomcat, app]
+
+  post_tasks:
+    - name: "POST — Wait for Tomcat to start (port {{ tomcat_port }})"
+      wait_for:
+        port: "{{ tomcat_port }}"
+        host: "{{ ansible_default_ipv4.address }}"
+        timeout: 120
+        state: started
+      tags: [tomcat, healthcheck]
+
+# ════════════════════════════════════════════════════════════
+# PLAY 4: Database servers
+# STRATEGY: linear (default) — all DBs configured together
+# ════════════════════════════════════════════════════════════
+- name: "PLAY 4 — Configure PostgreSQL Database Servers"
+  hosts: dbservers
+  gather_facts: yes
+  vars_files:
+    - vault/secrets.yml
+
+  # TOPIC: Strategy — linear (default)
+  # linear = run each task on ALL hosts before moving to next task
+  # free   = each host moves to next task independently (faster but less ordered)
+  strategy: linear
+
+  roles:
+    - role: postgres
+      tags: [postgres, db]
+
+  post_tasks:
+    - name: "POST — Verify PostgreSQL is accepting connections"
+      wait_for:
+        port: "{{ postgres_port }}"
+        host: "{{ ansible_default_ipv4.address }}"
+        timeout: 60
+        state: started
+      tags: [postgres, healthcheck]
+
+    - name: "POST — Send Slack notification on success"
+      uri:
+        url: "{{ slack_webhook_url }}"
+        method: POST
+        body_format: json
+        body:
+          text: >
+            ✅ *{{ app_name }} v{{ app_version }}* deployed to *{{ env }}*
+            DB: {{ inventory_hostname }} | {{ ansible_date_time.iso8601 }}
+        status_code: 200
+      ignore_errors: yes   # don't fail deploy if Slack is down!
+      tags: [postgres, notify, slack]

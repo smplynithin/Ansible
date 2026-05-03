@@ -1,0 +1,50 @@
+# ============================================================
+# inventories/aws_ec2.yml — DYNAMIC INVENTORY (AWS EC2)
+# TOPIC COVERED: Dynamic Inventory, AWS EC2 plugin
+#
+# Prerequisites:
+#   pip install boto3 botocore
+#   ansible-galaxy collection install amazon.aws
+#
+# Usage:
+#   ansible-inventory -i inventories/aws_ec2.yml --graph
+#   ansible -i inventories/aws_ec2.yml all -m ping
+# ============================================================
+
+plugin: amazon.aws.aws_ec2
+
+# AWS region to scan
+regions:
+  - ap-south-1      # Mumbai — closest to you!
+  - ap-southeast-1  # Singapore
+
+# Only show running instances
+filters:
+  instance-state-name: running
+  tag:Project: myapp          # Only EC2s tagged Project=myapp
+
+# Creates host groups based on EC2 tags automatically
+# e.g. tag Role=webserver → group: tag_Role_webserver
+keyed_groups:
+  - key: tags.Role
+    prefix: role
+    separator: "_"
+  - key: tags.Environment
+    prefix: env
+
+# Use private IP (since control node is inside same VPC)
+# Change to public-ip-address if control node is outside AWS
+hostnames:
+  - private-ip-address
+
+# Variables automatically added to each host from EC2 metadata
+compose:
+  ansible_host: private_ip_address
+  ec2_region: placement.region
+  ec2_instance_type: instance_type
+
+# Cache the results for 5 minutes (avoids hitting AWS API every time)
+cache: true
+cache_plugin: jsonfile
+cache_connection: /tmp/aws_ec2_cache
+cache_timeout: 300

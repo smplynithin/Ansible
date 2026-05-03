@@ -1,0 +1,15 @@
+# ============================================================
+# group_vars/webservers.yml — Variables ONLY for webservers
+# ============================================================
+nginx_worker_processes: auto
+nginx_worker_connections: 1024
+nginx_keepalive_timeout: 65
+nginx_client_max_body_size: "50m"
+
+# List of backend app servers Nginx will load balance to
+upstream_servers:
+  - "172.31.20.1:{{ tomcat_port }}"
+  - "172.31.20.2:{{ tomcat_port }}"
+
+# Load balancing method: round_robin / least_conn / ip_hash
+nginx_lb_method: "least_conn"

@@ -1,0 +1,16 @@
+# ============================================================
+# roles/common/defaults/main.yml
+# TOPIC COVERED: Role defaults (lowest priority variables)
+# defaults = "these are the fallback values; override them freely"
+# ============================================================
+ntp_servers:
+  - 0.pool.ntp.org
+  - 1.pool.ntp.org
+
+swap_size_mb: 2048
+swap_file_path: /swapfile
+
+sysctl_settings:
+  net.ipv4.tcp_fin_timeout: 30
+  net.core.somaxconn: 65535
+  vm.swappiness: 10

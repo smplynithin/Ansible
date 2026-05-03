@@ -1,0 +1,161 @@
+# ============================================================
+# roles/postgres/tasks/main.yml
+# TOPICS COVERED:
+#   - Modules: apt, postgresql_db, postgresql_user, template, lineinfile
+#   - Block / Rescue / Always (full error handling)
+#   - no_log: true (hide secrets from output)
+#   - loop over list
+#   - delegate_to (cross-host backup)
+#   - Tags
+# ============================================================
+---
+
+# ──────────────────────────────────────────────
+# SECTION 1: Install PostgreSQL
+# ──────────────────────────────────────────────
+
+- name: "[postgres] Install PostgreSQL {{ postgres_version }} + client tools"
+  apt:
+    name:
+      - "postgresql-{{ postgres_version }}"
+      - "postgresql-contrib"
+      - "python3-psycopg2"    # MUST have — enables Ansible's postgresql_* modules
+      - "libpq-dev"
+    state: present
+    update_cache: yes
+  tags: [postgres, install]
+
+# ──────────────────────────────────────────────
+# SECTION 2: Full Block / Rescue / Always
+# TOPIC: Error handling
+#
+# Think of it like try/catch/finally in Java/Python
+# ──────────────────────────────────────────────
+
+- name: "[postgres] Full database setup with error handling"
+  block:
+
+    # ── Start PostgreSQL service ──────────────────────────────
+    - name: "[postgres] Start and enable PostgreSQL"
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    # ── Create database ───────────────────────────────────────
+    - name: "[postgres] Create application database"
+      postgresql_db:
+        name: "{{ db_name }}"
+        encoding: UTF8
+        lc_collate: "en_US.UTF-8"
+        lc_ctype: "en_US.UTF-8"
+        state: present
+      become_user: postgres       # run as postgres OS user
+
+    # ── Create user ───────────────────────────────────────────
+    - name: "[postgres] Create application DB user"
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        db: "{{ db_name }}"
+        priv: "ALL"
+        state: present
+      become_user: postgres
+      no_log: true               # CRITICAL: hides password from Ansible logs!
+
+    # ── Revoke public schema access ───────────────────────────
+    - name: "[postgres] Revoke public connect from public role (security)"
+      postgresql_privs:
+        db: "{{ db_name }}"
+        role: PUBLIC
+        type: schema
+        obj: public
+        privs: CREATE
+        state: absent
+      become_user: postgres
+
+    # ── Deploy pg_hba.conf (who can connect) ─────────────────
+    - name: "[postgres] Deploy pg_hba.conf from template"
+      template:
+        src: pg_hba.conf.j2
+        dest: "{{ postgres_config_dir }}/pg_hba.conf"
+        owner: postgres
+        group: postgres
+        mode: '0640'
+        backup: yes
+      notify: Restart PostgreSQL
+      tags: [postgres, config]
+
+    # ── Deploy postgresql.conf (performance tuning) ───────────
+    - name: "[postgres] Deploy postgresql.conf from template"
+      template:
+        src: postgresql.conf.j2
+        dest: "{{ postgres_config_dir }}/postgresql.conf"
+        owner: postgres
+        group: postgres
+        mode: '0644'
+        backup: yes
+      notify: Restart PostgreSQL
+      tags: [postgres, config]
+
+    # ── Create monitoring user (read-only) ────────────────────
+    - name: "[postgres] Create monitoring read-only user"
+      postgresql_user:
+        name: monitoring
+        password: "{{ vault_db_password | hash('sha256') }}"
+        role_attr_flags: "NOSUPERUSER,NOCREATEDB,NOCREATEROLE"
+        state: present
+      become_user: postgres
+      no_log: true    # hide password from logs
+      tags: [postgres, monitoring]
+
+  rescue:
+    # ────────────────────────────────────────────────────────
+    # RESCUE: Runs ONLY if any task in 'block' fails
+    # ────────────────────────────────────────────────────────
+    - name: "[postgres] RESCUE — Alert on DB setup failure"
+      debug:
+        msg: |
+          ❌ PostgreSQL setup FAILED on {{ inventory_hostname }}
+          Failed task: {{ ansible_failed_task.name }}
+          Error: {{ ansible_failed_result.msg | default('unknown') }}
+
+    - name: "[postgres] RESCUE — Log failure with timestamp"
+      lineinfile:
+        path: "{{ app_log_dir }}/deploy_errors.log"
+        line: "{{ ansible_date_time.iso8601 }} | POSTGRES FAIL | {{ inventory_hostname }} | {{ ansible_failed_task.name }}"
+        create: yes
+      delegate_to: localhost    # write to control node log
+
+    - name: "[postgres] RESCUE — Fail the play explicitly"
+      fail:
+        msg: "PostgreSQL setup failed — see {{ app_log_dir }}/deploy_errors.log"
+
+  always:
+    # ────────────────────────────────────────────────────────
+    # ALWAYS: Runs regardless of success or failure
+    # ────────────────────────────────────────────────────────
+    - name: "[postgres] ALWAYS — Verify PostgreSQL is running"
+      service:
+        name: postgresql
+        state: started
+
+    - name: "[postgres] ALWAYS — Record deployment attempt"
+      shell: |
+        echo "{{ ansible_date_time.iso8601 }} | postgres | {{ inventory_hostname }} | {{ env }}" \
+        >> /tmp/all_deployments.log
+      delegate_to: localhost    # record on control node
+  tags: [postgres, setup]
+
+# ──────────────────────────────────────────────
+# SECTION 3: Backup task using delegate_to
+# TOPIC: delegate_to + run_once
+# ──────────────────────────────────────────────
+
+- name: "[postgres] Take DB dump before any schema changes"
+  shell: |
+    pg_dump {{ db_name }} > /opt/backups/{{ db_name }}_{{ ansible_date_time.date }}.sql
+  become_user: postgres
+  delegate_to: "{{ groups['dbservers'][0] }}"   # always run on db01
+  run_once: true                                 # run only ONCE total (not per host)
+  tags: [postgres, backup]

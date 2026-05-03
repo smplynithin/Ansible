@@ -1,0 +1,23 @@
+# ============================================================
+# molecule/default/tasks/converge.yml
+# TOPIC: Molecule — runs the role inside test container
+# ============================================================
+---
+- name: "Molecule converge — test common role"
+  hosts: all
+  gather_facts: yes
+
+  vars:
+    # Override variables for testing
+    app_name: testapp
+    app_version: "1.0.0"
+    env: testing
+    app_owner: ubuntu
+    app_base_dir: /opt/testapp
+    app_log_dir: /var/log/testapp
+    app_config_dir: /etc/testapp
+    server_timezone: "UTC"
+    swap_size_mb: 512
+
+  roles:
+    - role: common

@@ -1,0 +1,6 @@
+# ============================================================
+# host_vars/web01.yml — Variables ONLY for web01 (primary)
+# TOPIC COVERED: host_vars (highest precedence group)
+# ============================================================
+is_primary_lb: true
+nginx_status_enabled: true   # Enable /nginx_status for monitoring

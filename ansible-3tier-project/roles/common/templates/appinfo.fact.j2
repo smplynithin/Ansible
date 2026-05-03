@@ -1,0 +1,15 @@
+# ============================================================
+# templates/appinfo.fact.j2 — Custom Facts Template
+# TOPIC COVERED: Templates (Jinja2) + Custom Facts
+#
+# This file lands on the node as /etc/ansible/facts.d/appinfo.fact
+# Ansible reads it automatically during fact gathering
+# Access values as: ansible_local.appinfo.app_name
+# ============================================================
+[appinfo]
+app_name={{ app_name }}
+app_version={{ app_version }}
+environment={{ env }}
+deployed_at={{ ansible_date_time.iso8601 }}
+deployed_by=ansible
+control_node={{ ansible_env.HOSTNAME | default('unknown') }}
