@@ -286,6 +286,170 @@ db_password: "{{ lookup('amazon.aws.aws_secret', 'prod/db/password', region='ap-
 
 ## 8. Error Handling
 
+## Part 1: Ansible Error Handling (Core Essentials)
+
+By default, Ansible stops executing a play on a host the moment a task fails on that host (other hosts continue independently). These are the constructs you actually need day-to-day — trimmed to what's used in real playbooks.
+
+### 1. `ignore_errors`
+Continues execution on a host even if a task fails. Use sparingly — it hides real failures if overused.
+
+```yaml
+- name: Try to stop a service that may not exist
+  ansible.builtin.service:
+    name: legacy-app
+    state: stopped
+  ignore_errors: true
+```
+
+### 2. `failed_when`
+Lets you define custom logic for what counts as "failed," overriding the module's default success/fail detection. Useful when a command returns exit code 0 but the output indicates a problem.
+
+```yaml
+- name: Run a health check script
+  ansible.builtin.command: /opt/scripts/health_check.sh
+  register: health_result
+  failed_when: "'ERROR' in health_result.stdout"
+```
+
+### 3. `block` / `rescue` / `always`
+The closest equivalent to try/catch/finally, and the backbone of structured error handling in real playbooks.
+
+```yaml
+- name: Deploy application with rollback on failure
+  block:
+    - name: Copy new build artifact
+      ansible.builtin.copy:
+        src: app.jar
+        dest: /opt/app/app.jar
+
+    - name: Restart application service
+      ansible.builtin.service:
+        name: myapp
+        state: restarted
+
+  rescue:
+    - name: Rollback to previous build
+      ansible.builtin.copy:
+        src: /opt/app/backup/app.jar
+        dest: /opt/app/app.jar
+
+    - name: Restart service with old build
+      ansible.builtin.service:
+        name: myapp
+        state: restarted
+
+    - name: Fail the play explicitly after rollback
+      ansible.builtin.fail:
+        msg: "Deployment failed, rolled back to previous version"
+
+  always:
+    - name: Send deployment status notification
+      ansible.builtin.debug:
+        msg: "Deployment attempt finished for {{ inventory_hostname }}"
+```
+
+- `block` — the main tasks you want to run.
+- `rescue` — runs only if a task in the block fails; treat it like a catch.
+- `always` — runs regardless of success or failure; treat it like a finally.
+
+### 4. Retry logic with `retries` / `until`
+Avoids false failures on transient issues (e.g., waiting for a service to come up).
+
+```yaml
+- name: Wait for application to respond
+  ansible.builtin.uri:
+    url: "http://localhost:8080/health"
+    status_code: 200
+  register: result
+  retries: 5
+  delay: 10
+  until: result.status == 200
+```
+
+### 5. `debug` + `register` for diagnosis
+Always register the output of a risky task so you can inspect it in `rescue` or `failed_when` conditions.
+
+```yaml
+- name: Run migration script
+  ansible.builtin.command: /opt/app/migrate.sh
+  register: migration_output
+  ignore_errors: true
+
+- name: Show migration output if it failed
+  ansible.builtin.debug:
+    var: migration_output.stdout_lines
+  when: migration_output.failed
+```
+
+---
+
+## Part 2: `delegate_to`, `include_tasks`, `import_tasks`
+
+### `delegate_to`
+Runs a specific task on a different host than the one the play is currently targeting, while everything else in the play still runs against the original host. This is essential any time an action needs to happen on a control point — a load balancer, a monitoring system, a bastion — rather than on the target server itself.
+
+```yaml
+- name: Deregister node from load balancer before deployment
+  community.general.haproxy:
+    state: disabled
+    host: "{{ inventory_hostname }}"
+    socket: /var/run/haproxy.sock
+  delegate_to: lb01.internal
+
+- name: Deploy new artifact on the app server itself
+  ansible.builtin.copy:
+    src: app.jar
+    dest: /opt/app/app.jar
+
+- name: Re-register node with load balancer after deployment
+  community.general.haproxy:
+    state: enabled
+    host: "{{ inventory_hostname }}"
+    socket: /var/run/haproxy.sock
+  delegate_to: lb01.internal
+
+Common real-world uses of `delegate_to`:
+- Updating a load balancer (HAProxy/ALB/Nginx) to drain/add a node during rolling deploys.
+- Running a database migration from a single designated host instead of every app server.
+- Registering/deregistering with a monitoring or service-discovery system (Consul, Zabbix).
+- `delegate_to: localhost` — running a task from the Ansible control node itself (e.g., calling an API, writing a local report).
+
+### `include_tasks` vs `import_tasks`
+Both pull in tasks from another file, but they behave fundamentally differently — this trips up most people at least once.
+
+| | `import_tasks` | `include_tasks` |
+|---|---|---|
+| Processed | Statically, at **playbook parse time** | Dynamically, at **runtime** |
+| Can use `loop` on the include itself | No | Yes |
+| Conditional (`when`) applies to | Every task inside the file individually | The include statement as a whole (short-circuits) |
+| Tags | Applied per-task, always evaluated | Only evaluated if the include actually runs |
+| `--list-tasks` / `--list-tags` shows contents | Yes (fully expanded) | No (shows only the include line) |
+| Good for | Static structure, predictable task lists, tagging/auditing | Conditional logic, loops, deciding at runtime which file to load |
+
+**`import_tasks` example** (static — resolved before the play runs):
+```yaml
+- name: Import common setup tasks
+  ansible.builtin.import_tasks: common_setup.yml
+```
+
+**`include_tasks` example** (dynamic — decided while running, supports looping):
+```yaml
+- name: Include environment-specific deploy logic
+  ansible.builtin.include_tasks: "deploy_{{ target_env }}.yml"
+
+- name: Run a task file once per service
+  ansible.builtin.include_tasks: restart_service.yml
+  loop:
+    - api-service
+    - worker-service
+    - scheduler-service
+  loop_control:
+    loop_var: service_name
+```
+
+**Rule of thumb:** if the task file is always the same and you want full visibility into the task list up front (good for CI linting/auditing), use `import_tasks`. If you need to loop over the include, choose the file dynamically, or want `when` to skip the whole file cheaply without evaluating every task inside it, use `include_tasks`.
+
+
 ```yaml
 - block:
     - include_tasks: deploy.yml
@@ -363,6 +527,361 @@ ansible-playbook site.yml --check --diff
 **Ansible Tower/AWX** — one-liner to remember: adds Web UI, RBAC, scheduling, audit logs, credential vaulting on top of core Ansible for team use.
 
 **Terraform + Ansible** — Terraform provisions infra (VMs/VPCs), Ansible configures what's inside them. Know this pairing even if you don't go deep.
+
+
+## Part 3: Real-Time Use Case — App Deployment via Ansible, Triggered by Jenkins
+
+**Scenario:** Deploy a Java/Spring Boot microservice to a fleet of `dev` and `prod` servers behind a load balancer, with zero-downtime rolling updates, config templating, and automatic rollback on failure — triggered from Jenkins.
+
+### Project directory structure
+
+```
+ansible-deploy/
+├── ansible.cfg
+├── requirements.yml
+├── inventory/
+│   ├── dev/
+│   │   └── hosts.ini
+│   └── prod/
+│       └── hosts.ini
+├── group_vars/
+│   ├── all.yml
+│   ├── dev.yml
+│   └── prod.yml
+├── roles/
+│   └── app_deploy/
+│       ├── defaults/
+│       │   └── main.yml
+│       ├── vars/
+│       │   └── main.yml
+│       ├── tasks/
+│       │   ├── main.yml
+│       │   ├── deploy.yml
+│       │   └── rollback.yml
+│       ├── handlers/
+│       │   └── main.yml
+│       ├── templates/
+│       │   └── app.conf.j2
+│       └── files/
+│           └── healthcheck.sh
+├── playbook.yml
+└── Jenkinsfile
+```
+
+### `roles/app_deploy/tasks/main.yml`
+```yaml
+- name: Deregister this node from the load balancer
+  community.general.haproxy:
+    state: disabled
+    host: "{{ inventory_hostname }}"
+    socket: /var/run/haproxy.sock
+  delegate_to: "{{ loadbalancer_host }}"
+
+- name: Run deployment with rollback safety net
+  block:
+    - name: Include deploy tasks
+      ansible.builtin.include_tasks: deploy.yml
+  rescue:
+    - name: Include rollback tasks
+      ansible.builtin.include_tasks: rollback.yml
+    - name: Fail build explicitly so Jenkins marks it as failed
+      ansible.builtin.fail:
+        msg: "Deployment failed on {{ inventory_hostname }}, rollback executed"
+
+- name: Re-register this node with the load balancer
+  community.general.haproxy:
+    state: enabled
+    host: "{{ inventory_hostname }}"
+    socket: /var/run/haproxy.sock
+  delegate_to: "{{ loadbalancer_host }}"
+```
+
+### `playbook.yml` (rolling, one host at a time)
+```yaml
+- name: Deploy application with zero-downtime rolling update
+  hosts: appservers
+  become: true
+  serial: 1
+  roles:
+    - app_deploy
+```
+
+### `Jenkinsfile` (Declarative Pipeline)
+```groovy
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ENV', choices: ['dev', 'prod'], description: 'Target environment')
+        string(name: 'BUILD_VERSION', defaultValue: '', description: 'Artifact version to deploy')
+    }
+
+    environment {
+        ANSIBLE_VAULT_PASS = credentials('ansible-vault-password')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/company/ansible-deploy.git'
+            }
+        }
+
+        stage('Lint Playbook') {
+            steps {
+                sh 'ansible-lint playbook.yml'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh """
+                    echo \$ANSIBLE_VAULT_PASS > .vault_pass
+                    ansible-playbook -i inventory/${params.ENV}/hosts.ini playbook.yml \
+                        --vault-password-file .vault_pass \
+                        -e BUILD_VERSION=${params.BUILD_VERSION}
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'rm -f .vault_pass'
+        }
+    }
+}
+```
+
+---
+
+## Part 4: How Do You Achieve a Zero-Downtime Rolling Deployment with Ansible?
+
+The core idea: never take the whole fleet down at once, and never send traffic to a node that isn't ready. Ansible achieves this through a combination of **batching**, **load-balancer coordination**, and **health verification** before moving to the next batch.
+
+### 1. Control batch size with `serial`
+`serial` tells Ansible how many hosts to process per batch instead of all hosts simultaneously.
+
+```yaml
+- hosts: appservers
+  serial: 1          # one host at a time — safest, slowest
+  # or
+  serial: "25%"       # rolling batches of 25% of the fleet
+  # or a staged rollout:
+  serial:
+    - 1        # canary: deploy to 1 host first
+    - 3        # then 3 more
+    - "100%"   # then the rest
+```
+Staged `serial` lists are extremely common: deploy to a single canary host first, verify it's healthy, then widen the batch. If the canary fails, the play stops before touching the rest of the fleet.
+
+### 2. Deregister the node from the load balancer before touching it
+This is where `delegate_to` becomes essential — the deregistration command must run against the load balancer, not the app server being updated.
+
+```yaml
+- name: Drain node from load balancer
+  community.general.haproxy:
+    state: disabled
+    host: "{{ inventory_hostname }}"
+    socket: /var/run/haproxy.sock
+  delegate_to: "{{ loadbalancer_host }}"
+```
+For cloud load balancers, the equivalent is deregistering the instance from an AWS ALB/NLB target group (`community.aws.elb_target` / `amazon.aws.elb_target_group_info`) or deregistering from an Azure/GCP load balancer backend pool.
+
+### 3. Let in-flight connections finish (connection draining)
+Give the LB time to stop sending new requests and let existing ones complete before you touch the process.
+
+```yaml
+- name: Wait for connections to drain
+  ansible.builtin.wait_for:
+    timeout: 30
+```
+
+### 4. Deploy and restart on the drained node only
+Because this node is already out of rotation, restarting it causes zero user-facing impact.
+
+```yaml
+- name: Deploy new build
+  ansible.builtin.copy:
+    src: "app-{{ app_version }}.jar"
+    dest: /opt/app/current.jar
+
+- name: Restart service
+  ansible.builtin.service:
+    name: myapp
+    state: restarted
+```
+
+### 5. Verify health before re-adding to rotation
+Never re-register a node until it's provably healthy — this is the step that actually prevents downtime.
+
+```yaml
+- name: Confirm application health endpoint
+  ansible.builtin.uri:
+    url: "http://localhost:8080/actuator/health"
+    status_code: 200
+  register: health
+  retries: 10
+  delay: 5
+  until: health.status == 200
+```
+
+### 6. Re-register with the load balancer
+```yaml
+- name: Re-add node to load balancer
+  community.general.haproxy:
+    state: enabled
+    host: "{{ inventory_hostname }}"
+    socket: /var/run/haproxy.sock
+  delegate_to: "{{ loadbalancer_host }}"
+```
+
+### 7. Fail fast and stop the rollout if a batch is unhealthy
+Wrap steps 3–5 in a `block`/`rescue` so a bad node triggers rollback for that node, and combine with `max_fail_percentage` (or simply `serial` batching, which naturally halts on failure since a failed host stops the play by default) so a bad build doesn't get rolled out to the entire fleet.
+
+### Putting it together
+```yaml
+- name: Zero-downtime rolling deployment
+  hosts: appservers
+  become: true
+  serial:
+    - 1
+    - "25%"
+    - "100%"
+  vars:
+    loadbalancer_host: lb01.internal
+  tasks:
+    - name: Drain from load balancer
+      community.general.haproxy:
+        state: disabled
+        host: "{{ inventory_hostname }}"
+        socket: /var/run/haproxy.sock
+      delegate_to: "{{ loadbalancer_host }}"
+
+    - name: Wait for connections to drain
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - block:
+        - name: Deploy new build
+          ansible.builtin.copy:
+            src: "app-{{ app_version }}.jar"
+            dest: /opt/app/current.jar
+
+        - name: Restart service
+          ansible.builtin.service:
+            name: myapp
+            state: restarted
+
+        - name: Confirm health
+          ansible.builtin.uri:
+            url: "http://localhost:8080/actuator/health"
+            status_code: 200
+          register: health
+          retries: 10
+          delay: 5
+          until: health.status == 200
+      rescue:
+        - name: Roll back this node
+          ansible.builtin.include_tasks: rollback.yml
+        - name: Fail the play so the batch stops here
+          ansible.builtin.fail:
+            msg: "Health check failed on {{ inventory_hostname }} — halting rollout"
+
+    - name: Re-add to load balancer
+      community.general.haproxy:
+        state: enabled
+        host: "{{ inventory_hostname }}"
+        socket: /var/run/haproxy.sock
+      delegate_to: "{{ loadbalancer_host }}"
+```
+
+**Why this achieves zero downtime:** at any point in time, only the small batch currently being updated is out of the load balancer's rotation — the rest of the fleet keeps serving traffic. A node is never re-added until its health check passes, and a failed health check halts the rollout before it spreads to the next batch, rather than taking the whole fleet down or serving traffic from a broken node.
+
+---
+
+## Part 5: How Do You Manage Secrets at Enterprise Scale Across Many Teams/Pipelines?
+
+At small scale, a single `ansible-vault`-encrypted file is fine. At enterprise scale — many teams, many pipelines, many environments — that approach breaks down: one shared vault password becomes a single point of compromise, there's no per-team access boundary, no rotation strategy, and no audit trail. Here's how it's actually handled at scale.
+
+### 1. Move away from a single shared vault password
+Ansible Vault supports **multiple vault IDs**, so different teams/environments can each have their own encryption identity instead of one password everyone shares.
+
+```bash
+ansible-vault encrypt group_vars/prod/secrets.yml --vault-id prod@prompt
+ansible-vault encrypt group_vars/dev/secrets.yml --vault-id dev@prompt
+```
+
+```yaml
+# ansible.cfg
+[defaults]
+vault_identity_list = dev@~/.vault_pass_dev.txt, prod@~/.vault_pass_prod.txt
+```
+This alone limits blast radius: a leaked `dev` password doesn't expose `prod` secrets, and each team can own its own vault identity.
+
+### 2. Prefer an external secrets manager over static encrypted files
+The real shift at enterprise scale is moving secrets **out of the Git repo entirely** and pulling them at runtime from a centralized, access-controlled secret store:
+
+- **HashiCorp Vault** — via the `community.hashi_vault` collection
+- **AWS Secrets Manager / SSM Parameter Store** — via `amazon.aws.aws_secret` lookup
+- **Azure Key Vault** — via `azure.azcollection`
+- **CyberArk / Thycotic** — common in large regulated enterprises
+
+```yaml
+- name: Fetch DB password from HashiCorp Vault
+  ansible.builtin.set_fact:
+    db_password: "{{ lookup('community.hashi_vault.hashi_vault', 'secret=secret/data/myapp/db:password') }}"
+```
+This means the secret never sits encrypted-at-rest in Git at all — it's fetched just-in-time during the playbook run, and access is controlled by the secrets manager's own IAM/ACL policies rather than a shared vault password.
+
+### 3. Enforce per-team / per-namespace access boundaries
+In a multi-team setup, the secrets backend (not Ansible) should enforce who can read what:
+- HashiCorp Vault: separate secret **paths/namespaces per team** (`secret/team-payments/*`, `secret/team-search/*`) with policies bound to each team's auth method (LDAP group, AppRole, or Kubernetes service account).
+- AWS Secrets Manager: separate secrets per team/environment with IAM policies scoped by resource tag or ARN prefix, assumed via distinct pipeline IAM roles.
+- This means Team A's Jenkins pipeline literally cannot read Team B's secrets, even though both use the same Ansible tooling.
+
+### 4. Inject the unlock credential through the CI/CD credential store, never hard-coded
+In Jenkins specifically:
+```groovy
+environment {
+    VAULT_ADDR = 'https://vault.company.internal'
+    VAULT_TOKEN = credentials('vault-approle-token')   // Jenkins Credentials Binding plugin
+}
+```
+The Jenkins Credentials store (backed by its own encrypted credential provider, or better, a Jenkins-to-Vault plugin using short-lived AppRole/OIDC tokens) hands out a short-lived token per build rather than a long-lived static password baked into the Jenkinsfile or repo.
+
+### 5. Use short-lived, dynamically generated secrets where possible
+Rather than static passwords rotated manually, HashiCorp Vault (and AWS Secrets Manager) can issue **dynamic secrets** — e.g., a database credential generated on demand with a short TTL, unique per pipeline run, and automatically revoked after expiry. This drastically reduces the value of a leaked credential and removes manual rotation overhead entirely.
+
+### 6. Rotation policy
+- Static secrets that can't go dynamic (API keys for third-party SaaS, etc.) should have an enforced rotation cadence (e.g., 90 days) tracked centrally, not per-team spreadsheets.
+- Vault password/AppRole credentials used to unlock Ansible Vault or the secrets backend should themselves be rotated and never committed anywhere, including CI logs.
+
+### 7. Audit logging
+Enterprise secret managers log every read: who/what accessed which secret, when, from which pipeline/IP. This is usually a compliance requirement (SOC2/ISO27001) and is something static `ansible-vault` files can't give you — a decrypted vault file leaves no record of who actually read which value once it's on disk.
+
+### 8. Keep Git clean regardless of approach
+- Add pre-commit hooks / `git-secrets` or `detect-secrets` scanning in the pipeline to catch accidentally committed plaintext secrets before merge.
+- Never log decrypted variables — set `no_log: true` on any task handling secret values so they don't leak into Jenkins console output.
+
+```yaml
+- name: Configure database connection
+  ansible.builtin.template:
+    src: db.conf.j2
+    dest: /etc/myapp/db.conf
+  no_log: true
+```
+
+### Summary — small scale vs enterprise scale
+
+| | Small team | Enterprise, many teams/pipelines |
+|---|---|---|
+| Secret storage | `ansible-vault` encrypted file in repo | External secrets manager (Vault/AWS Secrets Manager/Azure Key Vault) |
+| Access control | One shared vault password | Per-team paths/policies enforced by the secrets backend itself |
+| Credential lifetime | Long-lived, manually rotated | Short-lived, often dynamically generated per pipeline run |
+| CI/CD integration | Vault password stored as one Jenkins credential | Per-pipeline scoped tokens (AppRole/OIDC) via Jenkins Credentials/Vault plugin |
+| Audit trail | None (decrypted file, no access log) | Full access logging per secret, per identity, per timestamp |
+| Git hygiene | Encrypted file committed | Nothing sensitive touches Git; secret-scanning hooks as a safety net |
 
 ---
 
